@@ -7,6 +7,9 @@ import java.util.*;
 
 public class Heuristic {
     // central positions
+    private static final int BOARD_SIZE = Coordinate.NCubed;
+    private static final int LINE_LENGTH = Coordinate.N;
+
     private static final Set<Integer> CENTER_POSITIONS = new HashSet<>(Arrays.asList(
             21, 22, 25, 26,
             29, 30, 33, 34
@@ -36,6 +39,33 @@ public class Heuristic {
     private static final long PCORNER_POSITIONS_MASK = computePositionMask(PCORNER_POSITIONS);
     private static final long BCORNER_POSITIONS_MASK = computePositionMask(BCORNER_POSITIONS);
 
+    private static final long FULL_MASK = -1L >>> (64 - BOARD_SIZE);
+    private static final int[][] LINES_BY_POSITION = new int[BOARD_SIZE][];
+
+    static {
+        // Pre-compute all lines that touch each position. This greatly speeds up
+        // fork/double-threat detection because we avoid repeatedly walking the
+        // global Line list.
+        List<Integer>[] temp = new ArrayList[BOARD_SIZE];
+        for (int i = 0; i < BOARD_SIZE; i++) {
+            temp[i] = new ArrayList<>();
+        }
+
+        for (int i = 0; i < Line.lines.length; i++) {
+            long mask = Line.lines[i].positions();
+            long bits = mask;
+            while (bits != 0) {
+                int pos = Long.numberOfTrailingZeros(bits);
+                temp[pos].add(i);
+                bits &= (bits - 1);
+            }
+        }
+
+        for (int i = 0; i < BOARD_SIZE; i++) {
+            LINES_BY_POSITION[i] = temp[i].stream().mapToInt(Integer::intValue).toArray();
+        }
+    }
+
 
     /**
      * Evaluates the board from the perspective of the specified player.
@@ -45,7 +75,7 @@ public class Heuristic {
      * @return An integer score representing the desirability of the board state.
      */
     public static long evaluate(Board board, Player player, Weights w) {
-        int score = 0;
+        long score = 0;
         Player opponent = player.other();
 
         long playerPositions = (player == Player.X) ? board.xPositions : board.oPositions;
@@ -57,71 +87,43 @@ public class Heuristic {
 
             long playerLinePositions = linePositions & playerPositions;
             long opponentLinePositions = linePositions & opponentPositions;
-            long emptyLinePositions = linePositions & ~occupiedPositions;
 
             int playerCount = Bit.countOnes(playerLinePositions);
             int opponentCount = Bit.countOnes(opponentLinePositions);
-            int emptyCount = Bit.countOnes(emptyLinePositions);
+            int emptyCount = LINE_LENGTH - playerCount - opponentCount;
 
-            if (playerCount > 0 && opponentCount == 0) {
-                // open for the player
+            // blocked lines do not contribute; they cannot yield a win for either side.
+            if (playerCount > 0 && opponentCount > 0) {
+                score -= w.BLOCKED_LINE_PENALTY;
+                continue;
+            }
+
+            if (playerCount > 0) {
                 int centerCount = Bit.countOnes(playerLinePositions & CENTER_POSITIONS_MASK);
-                score += getScore(playerCount, centerCount, w);
-            } else if (opponentCount > 0 && playerCount == 0) {
-                // open for the opponent
+                score += getScore(playerCount, centerCount, emptyCount, w);
+            } else if (opponentCount > 0) {
                 int centerCount = Bit.countOnes(opponentLinePositions & CENTER_POSITIONS_MASK);
-                score -= getScore(opponentCount, centerCount, w) * w.OPPONENT_SCORE_MULTIPLIER;
+                score -= getScore(opponentCount, centerCount, emptyCount, w) * w.OPPONENT_SCORE_MULTIPLIER;
+            } else {
+                // fully open lines favour the side to move slightly
+                score += w.OPEN_LINE_BONUS;
             }
 
-            if (playerCount == 2 && emptyCount == 2) {
-                List<Integer> emptyPositionsList = Bit.onesList(emptyLinePositions);
-
-                for (int candidatePos : emptyPositionsList) {
-                    long hypotheticalPlayerPositions = Bit.set(playerPositions, candidatePos);
-                    long hypotheticalOccupied = occupiedPositions | Bit.positionMask(candidatePos);
-
-                    // Evaluate future forks if we place here
-                    int forksAfterPlacement = evaluatePotentialForks(hypotheticalPlayerPositions, hypotheticalOccupied);
-                    Board hypotheticalBoard = new Board();
-                    if (player == Player.X) {
-                        hypotheticalBoard.xPositions = hypotheticalPlayerPositions;
-                        hypotheticalBoard.oPositions = opponentPositions;
-                    } else {
-                        hypotheticalBoard.xPositions = opponentPositions;
-                        hypotheticalBoard.oPositions = hypotheticalPlayerPositions;
-                    }
-
-                    int moveCount = board.totalMoves();
-                    if (forksAfterPlacement > 0) {
-                        if (moveCount < 10) {
-                            score += w.SCORE_THREE;
-                        } else {
-                            score += w.SCORE_THREE * 4;
-                        }
-                    } else {
-                        score += w.SCORE_TWO * 2;
-                    }
-                }
-            }
-
-            // three in a row and an empty spot (immediate threat)
             if (opponentCount == 3 && emptyCount == 1) {
                 score -= w.IMMEDIATE_THREAT_PENALTY;
             }
 
-            // three in a row and an empty spot (immediate win possibility)
             if (playerCount == 3 && emptyCount == 1) {
                 score += w.IMMEDIATE_WIN_BONUS;
             }
         }
 
-        // central control
+        // positional control
         int playerCenterControl = Bit.countOnes(playerPositions & CENTER_POSITIONS_MASK);
         int opponentCenterControl = Bit.countOnes(opponentPositions & CENTER_POSITIONS_MASK);
         score += playerCenterControl * w.CENTER_CONTROL_MULTIPLIER;
         score -= opponentCenterControl * w.OPPONENT_CENTER_CONTROL_MULTIPLIER;
 
-        // corner control
         int playerPCorners = Bit.countOnes(playerPositions & PCORNER_POSITIONS_MASK);
         int opponentPCorners = Bit.countOnes(opponentPositions & PCORNER_POSITIONS_MASK);
         score += playerPCorners * w.PCORNER_CONTROL_MULTIPLIER;
@@ -132,20 +134,29 @@ public class Heuristic {
         score += playerBCorners * w.BCORNER_CONTROL_MULTIPLIER;
         score -= opponentBCorners * w.OPPONENT_BCORNER_CONTROL_MULTIPLIER;
 
-        // potential forks
-        int playerForks = evaluatePotentialForks(playerPositions, occupiedPositions);
-        int opponentForks = evaluatePotentialForks(opponentPositions, occupiedPositions);
-        score += playerForks * w.PLAYER_FORKS_MULTIPLIER;
-        score -= opponentForks * w.OPPONENT_FORKS_MULTIPLIER;
+        // fork pressure and defensive awareness
+        int playerForks = evaluatePotentialForks(playerPositions, occupiedPositions, opponentPositions);
+        int opponentForks = evaluatePotentialForks(opponentPositions, occupiedPositions, playerPositions);
+        score += (long) playerForks * w.PLAYER_FORKS_MULTIPLIER;
+        score -= (long) opponentForks * w.OPPONENT_FORKS_MULTIPLIER;
 
-        // opponent's potential forks in next move
+        int playerDoubleThreats = evaluateDoubleThreats(playerPositions, opponentPositions, occupiedPositions);
+        int opponentDoubleThreats = evaluateDoubleThreats(opponentPositions, playerPositions, occupiedPositions);
+        score += (long) playerDoubleThreats * w.DOUBLE_THREAT_BONUS;
+        score -= (long) opponentDoubleThreats * w.OPPONENT_DOUBLE_THREAT_PENALTY;
+
+        // Opponent's ability to fork next move (prevents tunnel vision)
         int opponentPotentialForks = evaluateOpponentPotentialForks(board, opponent, occupiedPositions);
-        score -= opponentPotentialForks * w.OPPONENT_POTENTIAL_FORKS_PENALTY;
+        score -= (long) opponentPotentialForks * w.OPPONENT_POTENTIAL_FORKS_PENALTY;
+
+        // Mobility: prefer states with more options and space to maneuver.
+        int mobility = Coordinate.NCubed - Bit.countOnes(occupiedPositions);
+        score += mobility * w.MOBILITY_MULTIPLIER;
 
         return score;
     }
 
-    private static int getScore(int count, int centerCount, Weights w) {
+    private static int getScore(int count, int centerCount, int emptyCount, Weights w) {
         int baseScore = switch (count) {
             case 1 -> w.SCORE_ONE;
             case 2 -> w.SCORE_TWO;
@@ -155,6 +166,11 @@ public class Heuristic {
         };
 
         baseScore += centerCount * w.CENTER_MULTIPLIER;
+
+        if (emptyCount == 1 && count == 2) {
+            // almost a fork point
+            baseScore += w.NEAR_FORK_BONUS;
+        }
 
         return baseScore;
     }
@@ -166,32 +182,30 @@ public class Heuristic {
      * @param occupiedPositions Bitmask of occupied positions.
      * @return The number of potential forks.
      */
-    private static int evaluatePotentialForks(long playerPositions, long occupiedPositions) {
+    private static int evaluatePotentialForks(long playerPositions, long occupiedPositions, long opponentPositions) {
         int forkCount = 0;
 
-        List<Long> potentialLines = new ArrayList<>();
+        long emptySpaces = ~occupiedPositions & FULL_MASK;
+        while (emptySpaces != 0) {
+            int pos = Long.numberOfTrailingZeros(emptySpaces);
+            emptySpaces &= (emptySpaces - 1);
 
-        for (Line line : Line.lines) {
-            long linePositions = line.positions();
-
-            long playerLinePositions = linePositions & playerPositions;
-            long emptyLinePositions = linePositions & ~occupiedPositions;
-
-            int playerCount = Bit.countOnes(playerLinePositions);
-            int emptyCount = Bit.countOnes(emptyLinePositions);
-
-            if (playerCount == 2 && emptyCount == 2) {
-                potentialLines.add(linePositions);
-            }
-        }
-
-        // overlapping positions in different lines
-        for (int i = 0; i < potentialLines.size(); i++) {
-            for (int j = i + 1; j < potentialLines.size(); j++) {
-                long intersection = potentialLines.get(i) & potentialLines.get(j) & ~occupiedPositions;
-                if (Bit.countOnes(intersection) > 0) {
-                    forkCount++;
+            int supportingLines = 0;
+            for (int lineIdx : LINES_BY_POSITION[pos]) {
+                Line line = Line.lines[lineIdx];
+                long mask = line.positions();
+                if ((mask & opponentPositions) != 0) {
+                    continue; // blocked
                 }
+                int playerCount = Bit.countOnes(mask & playerPositions);
+                int emptyCount = LINE_LENGTH - playerCount - Bit.countOnes(mask & opponentPositions);
+                if (playerCount == 2 && emptyCount == 2) {
+                    supportingLines++;
+                }
+            }
+
+            if (supportingLines >= 2) {
+                forkCount++;
             }
         }
 
@@ -210,19 +224,59 @@ public class Heuristic {
         int potentialForks = 0;
 
         // simulate the opponent's move
-        List<Integer> emptyPositions = Bit.onesList(~occupiedPositions);
+        long emptyPositions = ~occupiedPositions & FULL_MASK;
 
-        for (int position : emptyPositions) {
-            long newOpponentPositions = (opponent == Player.X) ? Bit.set(board.xPositions, position) : Bit.set(board.oPositions, position);
+        while (emptyPositions != 0) {
+            int position = Long.numberOfTrailingZeros(emptyPositions);
+            emptyPositions &= (emptyPositions - 1);
+
+            long newOpponentPositions = (opponent == Player.X)
+                    ? Bit.set(board.xPositions, position)
+                    : Bit.set(board.oPositions, position);
             long newOccupiedPositions = occupiedPositions | Bit.positionMask(position);
+            long playerPositions = (opponent == Player.X) ? board.oPositions : board.xPositions;
 
-            // num forks opponent can create from this move
-            int forks = evaluatePotentialForks(newOpponentPositions, newOccupiedPositions);
+            int forks = evaluatePotentialForks(newOpponentPositions, newOccupiedPositions, playerPositions);
             if (forks > 0) {
                 potentialForks += forks;
             }
         }
 
         return potentialForks;
+    }
+
+    private static int evaluateDoubleThreats(long playerPositions, long opponentPositions, long occupiedPositions) {
+        int doubleThreats = 0;
+
+        long emptySpaces = ~occupiedPositions & FULL_MASK;
+        while (emptySpaces != 0) {
+            int pos = Long.numberOfTrailingZeros(emptySpaces);
+            emptySpaces &= (emptySpaces - 1);
+
+            int threatLines = 0;
+            for (int lineIdx : LINES_BY_POSITION[pos]) {
+                Line line = Line.lines[lineIdx];
+                long mask = line.positions();
+                if ((mask & opponentPositions) != 0) {
+                    continue;
+                }
+                int playerCount = Bit.countOnes(mask & playerPositions);
+                int emptyCount = LINE_LENGTH - playerCount - Bit.countOnes(mask & opponentPositions);
+                int newCount = playerCount + 1;
+                int newEmpty = emptyCount - 1;
+                if (newCount == 4) {
+                    // winning immediately is even better than a fork
+                    threatLines += 2;
+                } else if (newCount == 3 && newEmpty == 1) {
+                    threatLines++;
+                }
+            }
+
+            if (threatLines >= 2) {
+                doubleThreats++;
+            }
+        }
+
+        return doubleThreats;
     }
 }

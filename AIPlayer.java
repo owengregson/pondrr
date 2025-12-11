@@ -13,6 +13,9 @@ public class AIPlayer {
     private static final double TIME_LIMIT_SECONDS = 13.8;
     private static final long NANOSECONDS_PER_SECOND = 1_000_000_000L;
     private static final long MAX_TIME = (long)(TIME_LIMIT_SECONDS * NANOSECONDS_PER_SECOND);
+    private static final long WIN_SCORE = 1_000_000_000L;
+    private static final long FULL_MASK = -1L >>> (64 - Coordinate.NCubed);
+    private static final int LINE_LENGTH = Coordinate.N;
     private static final boolean USE_FIXED_SEED = false;
     private static final long FIXED_SEED = 2398558964L;
     private static final long GLOBAL_SEED = USE_FIXED_SEED ? FIXED_SEED : System.nanoTime();
@@ -23,6 +26,7 @@ public class AIPlayer {
     private static final int CONVERGENCE_THRESHOLD = 12;
 
     private static final long[][] ZOBRIST_TABLE = new long[Coordinate.NCubed][2];
+    private static final long ZOBRIST_SIDE = threadRandom.get().nextLong();
     private static final long EMPTY_ZOBRIST = threadRandom.get().nextLong();
 
     private static final int[][] OPTIMAL_PAIRS = {
@@ -56,11 +60,13 @@ public class AIPlayer {
         final long value;
         final int depth;
         final int flag; // 0: exact, 1: lower bound, 2: upper bound
+        final int bestMove;
 
-        TranspositionEntry(long value, int depth, int flag) {
+        TranspositionEntry(long value, int depth, int flag, int bestMove) {
             this.value = value;
             this.depth = depth;
             this.flag = flag;
+            this.bestMove = bestMove;
         }
     }
 
@@ -100,7 +106,7 @@ public class AIPlayer {
                 return null;
             }
             board.makeMove(move, aiPlayer);
-            long val = aiInstance.minimax(board, depth - 1, Long.MIN_VALUE, Long.MAX_VALUE, false, aiPlayer, aiInstance.maxDepth);
+            long val = aiInstance.minimax(board, depth - 1, Long.MIN_VALUE, Long.MAX_VALUE, aiPlayer.other(), 1);
             if (DEBUG) {
                 System.out.println("[DEBUG] Parallel task move: " + move + " depth: " + depth + " val: " + val);
             }
@@ -125,6 +131,8 @@ public class AIPlayer {
     private final AtomicLong transpositionMisses = new AtomicLong(0);
     private final AtomicLong totalSearches = new AtomicLong(0);
     private final AtomicLong totalNodesEvaluated = new AtomicLong(0);
+    private final int[][] killerMoves = new int[MAX_DEPTH + 1][2];
+    private final int[][] historyHeuristic = new int[2][Coordinate.NCubed];
 
     public AIPlayer(Player aiPlayer, int maxDepth) {
         this.aiPlayer = aiPlayer;
@@ -163,6 +171,7 @@ public class AIPlayer {
         bestMoveSoFar = -1;
         timeUp = false;
         endTime = System.nanoTime() + maxTime;
+        resetMoveHeuristics();
 
         nodeCount.set(0);
         transpositionHits.set(0);
@@ -319,7 +328,7 @@ public class AIPlayer {
                         newBrd.xPositions = mBoard.xPositions;
                         newBrd.oPositions = mBoard.oPositions;
                         newBrd.makeMove(mv, aiPlayer);
-                        long val = minimax(newBrd, depth - 1, Long.MIN_VALUE, Long.MAX_VALUE, false, aiPlayer, maxDepth);
+                        long val = minimax(newBrd, depth - 1, Long.MIN_VALUE, Long.MAX_VALUE, aiPlayer.other(), 1);
                         results.add(new MoveEvaluation(mv, val));
                     }
                 }
@@ -402,6 +411,16 @@ public class AIPlayer {
         }
     }
 
+    private void resetMoveHeuristics() {
+        for (int d = 0; d < killerMoves.length; d++) {
+            killerMoves[d][0] = -1;
+            killerMoves[d][1] = -1;
+        }
+        for (int p = 0; p < historyHeuristic.length; p++) {
+            Arrays.fill(historyHeuristic[p], 0);
+        }
+    }
+
     private boolean shouldParallelize(int depth, int maxDepth, List < Integer > availMoves, long currentTime, long endTime) {
         long timeRemaining = endTime - currentTime;
         int movesCount = availMoves.size();
@@ -439,28 +458,40 @@ public class AIPlayer {
         return String.format("%.2f %s", mem, categories[category]);
     }
 
-    private long computeZobristHash(Board b) {
+    private long computeZobristHash(Board b, Player toMove) {
         long hash = EMPTY_ZOBRIST;
-        for (int pos = 0; pos < Coordinate.NCubed; pos++) {
-            if (Bit.isSet(b.xPositions, pos)) {
-                hash ^= ZOBRIST_TABLE[pos][0];
-            } else if (Bit.isSet(b.oPositions, pos)) {
-                hash ^= ZOBRIST_TABLE[pos][1];
-            }
+        long xs = b.xPositions;
+        while (xs != 0) {
+            int pos = Long.numberOfTrailingZeros(xs);
+            hash ^= ZOBRIST_TABLE[pos][0];
+            xs &= (xs - 1);
+        }
+        long os = b.oPositions;
+        while (os != 0) {
+            int pos = Long.numberOfTrailingZeros(os);
+            hash ^= ZOBRIST_TABLE[pos][1];
+            os &= (os - 1);
+        }
+        if (toMove == aiPlayer) {
+            hash ^= ZOBRIST_SIDE;
         }
         return hash;
     }
 
-    private long minimax(Board b, int depth, long alpha, long beta, boolean maxPlayer, Player lastP, int origMaxDepth) {
+    private long minimax(Board b, int depth, long alpha, long beta, Player toMove, int ply) {
         if (System.nanoTime() >= endTime) {
             timeUp = true;
             return 0; // Neutral if time is up
         }
 
-        long zHash = computeZobristHash(b);
+        nodeCount.incrementAndGet();
+        long alphaOrig = alpha;
+        long zHash = computeZobristHash(b, toMove);
         TranspositionEntry entry = transpositionTable.get(zHash);
+        Integer ttMove = null;
         if (entry != null && entry.depth >= depth) {
             transpositionHits.incrementAndGet();
+            ttMove = entry.bestMove >= 0 ? entry.bestMove : null;
             if (entry.flag == 0) {
                 return entry.value;
             } else if (entry.flag == 1) {
@@ -473,96 +504,133 @@ public class AIPlayer {
             }
         } else {
             transpositionMisses.incrementAndGet();
-            nodeCount.incrementAndGet();
         }
 
-        Player currentP = maxPlayer ? aiPlayer : opponent;
+        if (checkWinner(b, toMove.other())) {
+            long winScore = (toMove.other() == aiPlayer ? WIN_SCORE : -WIN_SCORE) + depth;
+            transpositionTable.put(zHash, new TranspositionEntry(winScore, depth, 0, -1));
+            return winScore;
+        }
 
-        if (depth == 0 || isTerminal(b, lastP)) {
-            long eval;
-            if (checkWinner(b, lastP)) {
-                int winScore = 1_000_000 + depth;
-                eval = (lastP == aiPlayer) ? winScore : -winScore;
-            } else {
-                eval = Heuristic.evaluate(b, aiPlayer, weights);
-            }
-            int fType = (eval <= alpha) ? 2 : (eval >= beta) ? 1 : 0;
-            transpositionTable.put(zHash, new TranspositionEntry(eval, depth, fType));
-
-            if (DEBUG) {
-                System.out.println("[DEBUG] Terminal node at depth " + depth + " eval: " + eval);
-            }
-
+        if (depth == 0 || b.isFull()) {
+            long eval = Heuristic.evaluate(b, aiPlayer, weights);
+            int flag = (eval <= alpha) ? 2 : (eval >= beta) ? 1 : 0;
+            transpositionTable.put(zHash, new TranspositionEntry(eval, depth, flag, -1));
             return eval;
         }
 
-        List < Integer > availMoves = b.getAvailableMoves();
+        int[] moves = new int[Coordinate.NCubed];
+        int moveCount = generateMoves(b, moves);
+        orderMoves(b, toMove, depth, moves, moveCount, ttMove);
 
-        Map < Integer, Long > moveScores = new HashMap < > ();
-        for (int mv: availMoves) {
-            b.makeMove(mv, currentP);
-            long eval = Heuristic.evaluate(b, aiPlayer, weights);
-            moveScores.put(mv, eval);
+        boolean maximizing = toMove == aiPlayer;
+        long bestVal = maximizing ? Long.MIN_VALUE : Long.MAX_VALUE;
+        int bestMove = -1;
+
+        for (int i = 0; i < moveCount && !timeUp; i++) {
+            int mv = moves[i];
+            b.makeMove(mv, toMove);
+            long eval;
+            if (checkWinner(b, toMove)) {
+                eval = (toMove == aiPlayer ? WIN_SCORE : -WIN_SCORE) + depth;
+            } else {
+                eval = minimax(b, depth - 1, alpha, beta, toMove.other(), ply + 1);
+            }
             b.undoMove(mv);
-        }
 
-        if (maxPlayer) {
-            availMoves.sort((m1, m2) -> Long.compare(moveScores.get(m2), moveScores.get(m1)));
-        } else {
-            availMoves.sort(Comparator.comparingLong(moveScores::get));
-        }
-
-        if (maxPlayer) {
-            long maxEval = Long.MIN_VALUE;
-            for (int mv: availMoves) {
-                if (System.nanoTime() >= endTime) {
-                    timeUp = true;
-                    break;
+            if (maximizing) {
+                if (eval > bestVal) {
+                    bestVal = eval;
+                    bestMove = mv;
                 }
-                b.makeMove(mv, currentP);
-                long eval = minimax(b, depth - 1, alpha, beta, false, currentP, origMaxDepth);
-                b.undoMove(mv);
-                maxEval = Math.max(maxEval, eval);
                 alpha = Math.max(alpha, eval);
-                if (beta <= alpha || timeUp) {
+                if (alpha >= beta) {
+                    updateKiller(mv, ply);
+                    updateHistory(toMove, mv, depth);
                     break;
                 }
-            }
-            int fType = (maxEval >= beta) ? 1 : 0;
-            transpositionTable.put(zHash, new TranspositionEntry(maxEval, depth, fType));
-
-            if (DEBUG) {
-                System.out.println("[DEBUG] Max node at depth " + depth + " best eval: " + maxEval);
-            }
-            return maxEval;
-        } else {
-            long minEval = Long.MAX_VALUE;
-            for (int mv: availMoves) {
-                if (System.nanoTime() >= endTime) {
-                    timeUp = true;
-                    break;
+            } else {
+                if (eval < bestVal) {
+                    bestVal = eval;
+                    bestMove = mv;
                 }
-                b.makeMove(mv, currentP);
-                long eval = minimax(b, depth - 1, alpha, beta, true, currentP, origMaxDepth);
-                b.undoMove(mv);
-                minEval = Math.min(minEval, eval);
                 beta = Math.min(beta, eval);
-                if (beta <= alpha || timeUp) {
+                if (alpha >= beta) {
+                    updateKiller(mv, ply);
+                    updateHistory(toMove, mv, depth);
                     break;
                 }
             }
-            int fType = (minEval <= alpha) ? 2 : 0;
-            transpositionTable.put(zHash, new TranspositionEntry(minEval, depth, fType));
-
-            if (DEBUG) {
-                System.out.println("[DEBUG] Min node at depth " + depth + " best eval: " + minEval);
-            }
-            return minEval;
         }
+
+        int fType = (bestVal <= alphaOrig) ? 2 : (bestVal >= beta) ? 1 : 0;
+        transpositionTable.put(zHash, new TranspositionEntry(bestVal, depth, fType, bestMove));
+        return bestVal;
     }
 
-    private boolean isTerminal(Board b, Player lastP) {
-        return checkWinner(b, lastP) || b.isFull();
+    private void updateKiller(int move, int depth) {
+        if (move == killerMoves[depth][0] || move == killerMoves[depth][1]) {
+            return;
+        }
+        killerMoves[depth][1] = killerMoves[depth][0];
+        killerMoves[depth][0] = move;
+    }
+
+    private void updateHistory(Player mover, int move, int depth) {
+        int idx = mover == aiPlayer ? 0 : 1;
+        historyHeuristic[idx][move] += depth * depth;
+    }
+
+    private boolean isKiller(int move, int depth) {
+        return killerMoves[depth][0] == move || killerMoves[depth][1] == move;
+    }
+
+    private int generateMoves(Board b, int[] buffer) {
+        long empty = ~(b.xPositions | b.oPositions) & FULL_MASK;
+        int count = 0;
+        while (empty != 0) {
+            int pos = Long.numberOfTrailingZeros(empty);
+            buffer[count++] = pos;
+            empty &= (empty - 1);
+        }
+        return count;
+    }
+
+    private void orderMoves(Board b, Player toMove, int depth, int[] moves, int moveCount, Integer ttMove) {
+        long[] scores = new long[moveCount];
+        int playerIdx = (toMove == aiPlayer) ? 0 : 1;
+        for (int i = 0; i < moveCount; i++) {
+            int mv = moves[i];
+            long score = historyHeuristic[playerIdx][mv];
+            if (ttMove != null && mv == ttMove) {
+                score += 1_000_000_0L;
+            }
+            if (isKiller(mv, depth)) {
+                score += 500_000L;
+            }
+            b.makeMove(mv, toMove);
+            if (checkWinner(b, toMove)) {
+                score += WIN_SCORE / 10;
+            } else {
+                score += Heuristic.evaluate(b, aiPlayer, weights) / 50;
+            }
+            b.undoMove(mv);
+            scores[i] = score;
+        }
+
+        // simple insertion sort to avoid allocations
+        for (int i = 1; i < moveCount; i++) {
+            int m = moves[i];
+            long s = scores[i];
+            int j = i - 1;
+            while (j >= 0 && scores[j] < s) {
+                scores[j + 1] = scores[j];
+                moves[j + 1] = moves[j];
+                j--;
+            }
+            scores[j + 1] = s;
+            moves[j + 1] = m;
+        }
     }
 
     private boolean checkWinner(Board b, Player p) {
