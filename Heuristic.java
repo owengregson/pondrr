@@ -109,11 +109,11 @@ public class Heuristic {
                 score += w.OPEN_LINE_BONUS;
             }
 
-            if (opponentCount == 3 && emptyCount == 1) {
+            if (opponentCount == LINE_LENGTH - 1 && emptyCount == 1) {
                 score -= w.IMMEDIATE_THREAT_PENALTY;
             }
 
-            if (playerCount == 3 && emptyCount == 1) {
+            if (playerCount == LINE_LENGTH - 1 && emptyCount == 1) {
                 score += w.IMMEDIATE_WIN_BONUS;
             }
         }
@@ -145,6 +145,14 @@ public class Heuristic {
         score += (long) playerDoubleThreats * w.DOUBLE_THREAT_BONUS;
         score -= (long) opponentDoubleThreats * w.OPPONENT_DOUBLE_THREAT_PENALTY;
 
+        int playerImmediateWinningSquares = countImmediateWinningSquares(playerPositions, opponentPositions, occupiedPositions);
+        int opponentImmediateWinningSquares = countImmediateWinningSquares(opponentPositions, playerPositions, occupiedPositions);
+        score += (long) playerImmediateWinningSquares * w.IMMEDIATE_WIN_SQUARE_BONUS;
+        score -= (long) opponentImmediateWinningSquares * w.OPPONENT_IMMEDIATE_WIN_SQUARE_PENALTY;
+
+        int blockedThreatIntersections = evaluateBlockedIntersections(playerPositions, opponentPositions);
+        score += (long) blockedThreatIntersections * w.BLOCKED_THREAT_INTERSECTION_BONUS;
+
         // Opponent's ability to fork next move (prevents tunnel vision)
         int opponentPotentialForks = evaluateOpponentPotentialForks(board, opponent, occupiedPositions);
         score -= (long) opponentPotentialForks * w.OPPONENT_POTENTIAL_FORKS_PENALTY;
@@ -167,9 +175,17 @@ public class Heuristic {
 
         baseScore += centerCount * w.CENTER_MULTIPLIER;
 
+        if (count == 2 && emptyCount == 2) {
+            baseScore += w.OPEN_TWO_BONUS;
+        }
+
         if (emptyCount == 1 && count == 2) {
             // almost a fork point
             baseScore += w.NEAR_FORK_BONUS;
+        }
+
+        if (count == 3 && emptyCount == 1) {
+            baseScore += w.CLOSED_THREE_BONUS;
         }
 
         return baseScore;
@@ -210,6 +226,36 @@ public class Heuristic {
         }
 
         return forkCount;
+    }
+
+    private static int countImmediateWinningSquares(long playerPositions, long opponentPositions, long occupiedPositions) {
+        int winningSquares = 0;
+
+        long emptySpaces = ~occupiedPositions & FULL_MASK;
+        while (emptySpaces != 0) {
+            int pos = Long.numberOfTrailingZeros(emptySpaces);
+            emptySpaces &= (emptySpaces - 1);
+
+            int winningLines = 0;
+            for (int lineIdx : LINES_BY_POSITION[pos]) {
+                Line line = Line.lines[lineIdx];
+                long mask = line.positions();
+                if ((mask & opponentPositions) != 0) {
+                    continue;
+                }
+                int playerCount = Bit.countOnes(mask & playerPositions);
+                int emptyCount = LINE_LENGTH - playerCount - Bit.countOnes(mask & opponentPositions);
+                if (playerCount == LINE_LENGTH - 1 && emptyCount == 1) {
+                    winningLines++;
+                }
+            }
+
+            if (winningLines > 0) {
+                winningSquares += winningLines;
+            }
+        }
+
+        return winningSquares;
     }
 
     /**
@@ -278,5 +324,37 @@ public class Heuristic {
         }
 
         return doubleThreats;
+    }
+
+    private static int evaluateBlockedIntersections(long playerPositions, long opponentPositions) {
+        int blocked = 0;
+
+        long tempPlayer = playerPositions;
+        while (tempPlayer != 0) {
+            int pos = Long.numberOfTrailingZeros(tempPlayer);
+            tempPlayer &= (tempPlayer - 1);
+
+            int blockedLines = 0;
+            for (int lineIdx : LINES_BY_POSITION[pos]) {
+                Line line = Line.lines[lineIdx];
+                long mask = line.positions();
+                long playerMask = mask & playerPositions;
+                long opponentMask = mask & opponentPositions;
+                if (playerMask == Bit.positionMask(pos) && Bit.countOnes(opponentMask) == LINE_LENGTH - 2) {
+                    int occupiedCount = Bit.countOnes(playerMask | opponentMask);
+                    int emptyCount = LINE_LENGTH - occupiedCount;
+                    if (emptyCount == 1) {
+                        blockedLines++;
+                    }
+                }
+            }
+
+            if (blockedLines > 1) {
+                // occupying this square simultaneously disrupted multiple near-threats
+                blocked++;
+            }
+        }
+
+        return blocked;
     }
 }
